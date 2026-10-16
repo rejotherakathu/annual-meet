@@ -19,12 +19,39 @@ Phone (GitHub Pages: index.html) ──POST text/plain JSON──▶ Apps Script
 
 The production project has no `doPost`. Login and scan recording are only callable through `google.script.run`, which works only inside pages the script serves itself. A GitHub Pages site can only reach the script over HTTP, so it needs a `doPost`.
 
-`ScannerApi.gs` adds that and nothing else:
-- **No existing function is changed** and `doGet` is untouched.
-- **The only write is the existing `recordBadgeAction`:** it stamps Entry Time or Meal Time and appends to Activity, with Scan Source `Volunteer Scanner`.
-- **Two extra reads:**
-  - a typed Badge ID is looked up to find its QR Token
-  - after a scan, the attendee's name, relationship and department are read for display
+`ScannerApi.gs` adds it as a **new file**. **No existing function is changed:** `doGet`, `recordBadgeAction` and the badge-URL flow are untouched.
+- **Login and logout:** the existing `volunteerLogin` / `volunteerLogout`.
+- **Scan:** a new `scannerApiScan_` with the **same rules and writes** as `recordBadgeAction`:
+  - checks the session and role (GATE → Entry, MEAL → Meal)
+  - requires Status = `Active`
+  - stamps Entry Time or Meal Time **only if empty**
+  - logs successful scans to Activity through the existing `logActivity_`
+  - returns the same messages (`ENTRY OK`, `ALREADY ENTERED`, `MEAL OK`, `MEAL ALREADY SERVED`, …)
+
+## Many gates and meal counters: short lock
+
+`recordBadgeAction` takes the script lock, then reads the whole Volunteers and Attendees tabs before writing. Every counter therefore waits in one queue for the whole scan, an estimated 1–3 s each (not measured).
+
+`scannerApiScan_` keeps only the part that must be exclusive inside the lock:
+
+| Step | Lock? | How |
+|---|---|---|
+| Session and role check | outside | session from the existing cache; Volunteers list cached 5 min |
+| Find the badge row | outside | TextFinder on the QR Token column (then Badge ID), not a full-sheet read |
+| Re-read that one row, check Entry/Meal Time, stamp if empty, flush | **inside** | ~one row read + one cell write |
+| Activity row | outside | existing `logActivity_` |
+
+**What stays the same:**
+- **Duplicate protection is just as strict:** the "already served?" check and the stamp happen together under the same script lock that `recordBadgeAction` uses.
+- **Sorted or inserted rows are safe:** inside the lock the row is re-verified, and searched again if it moved.
+
+**What's new under load:**
+- If the lock is busy for more than 10 s, the scan returns `SERVER_ERROR` and the phone keeps it and retries every 15 s. Scans are delayed, not lost.
+
+**Trade-offs:**
+- Deactivating a volunteer, or changing their role, takes effect within **5 minutes** (cache). `recordBadgeAction` applies it immediately.
+- A failed Activity append no longer fails the scan, because the stamp is already saved. It's logged to the Apps Script executions log instead.
+- Throughput isn't measured. Load-test with several phones on a copy before the event.
 
 ## How the page behaves (from the production script)
 
@@ -40,7 +67,7 @@ The production project has no `doPost`. Login and scan recording are only callab
   - **Red:** NOT A VALID BADGE, or BADGE NOT ACTIVE (Status ≠ `Active`)
   - **Blue:** saved on the phone
 - **Offline / server busy:** the scan is kept on the phone and retried every 15 s.
-  - `recordBadgeAction` stamps the time it actually syncs, not the time it was scanned.
+  - The server stamps the time the scan actually syncs, not the time it was scanned.
   - Queued scans sync only under a volunteer of the same role.
   - While offline, only duplicates on the same phone are caught.
 
